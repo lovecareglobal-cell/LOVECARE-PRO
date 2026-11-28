@@ -1,0 +1,603 @@
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:firebase_database/firebase_database.dart';
+import '../services/language_service.dart';
+import '../services/translations.dart';
+
+/// HR Page - Nurse Withdrawals - CEO Control
+/// Converted from hr-page-GHS-USD_3.html
+/// - Reads: ceoWithdrawals (live) + fallback: nurseWithdrawals, hrWithdrawals,
+///   withdrawalRequests, ceoHRPage/withdrawals (merges by id, so old withdrawals
+///   saved to a different path still show up - same recall fix as Registration Center)
+/// - Amounts: GHS is primary. If a record also has dollars / amountUSD / USD,
+///   both GHS + USD are shown. Totals are in GHS.
+/// - Approve / Reject: writes to ALL 5 paths (like the HTML did), + nurse notification
+/// - NEVER BLANK: always shows Loading, then List / Empty / Error banner.
+///   Firebase errors are shown on screen instead of a white page.
+
+class HRPageScreen extends StatefulWidget {
+  const HRPageScreen({super.key});
+  @override
+  State<HRPageScreen> createState() => _HRPageScreenState();
+}
+
+class _HRPageScreenState extends State<HRPageScreen> {
+  // FIX for "Database initialized multiple times":
+  // Use ONE cached FirebaseDatabase instance, created ONCE.
+  // Do NOT call instanceFor() on every read - each call with a
+  // slightly different URL format (trailing slash or not) makes
+  // Firebase think you are initializing a second database.
+  // Now that lib/firebase_options.dart HAS databaseURL, .instance works.
+  static FirebaseDatabase? _cachedDb;
+  FirebaseDatabase get _database {
+    _cachedDb ??= FirebaseDatabase.instance;
+    return _cachedDb!;
+  }
+  DatabaseReference _db(String path) => _database.ref(path);
+
+  List<Map<String, dynamic>> _all = [];
+  String _filter = 'all';
+  bool _loading = true;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadAll();
+  }
+
+  // ---------- Load ----------
+  Future<void> _loadAll() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      // 1. Live listener on the main path (like the HTML)
+      _db('ceoWithdrawals').onValue.listen(
+        (event) {
+          if (!mounted) return;
+          final val = event.snapshot.value;
+          final list = <Map<String, dynamic>>[];
+          if (val is Map) {
+            val.forEach((k, v) {
+              if (v is Map) list.add({'id': k.toString(), ...Map<String, dynamic>.from(v)});
+            });
+          }
+          _mergeAndSet(list, fromLive: true);
+        },
+        onError: (e) {
+          if (mounted) setState(() => _error = '${tr('hrLiveUpdatesFailed')}: $e');
+        },
+      );
+      // 2. One-time fallback: other paths where old withdrawals may live
+      await _loadFallback();
+      if (mounted) setState(() => _loading = false);
+    } catch (e) {
+      if (mounted) setState(() {
+        _loading = false;
+        _error = '${tr('hrCouldNotLoad')}: $e\n${tr('hrCheckDbUrl')}';
+      });
+    }
+  }
+
+  Future<void> _loadFallback() async {
+    final byId = <String, Map<String, dynamic>>{for (final w in _all) w['id'].toString(): w};
+    for (final path in ['nurseWithdrawals', 'hrWithdrawals', 'withdrawalRequests', 'ceoHRPage/withdrawals']) {
+      try {
+        final snap = await _db(path).get();
+        if (!snap.exists) continue;
+        final val = snap.value;
+        if (val is! Map) continue;
+        val.forEach((k, v) {
+          if (v is! Map) return;
+          final id = k.toString();
+          if (!byId.containsKey(id)) {
+            byId[id] = {'id': id, ...Map<String, dynamic>.from(v)};
+          }
+        });
+      } catch (_) {}
+    }
+    if (mounted) setState(() => _all = byId.values.toList());
+  }
+
+  void _mergeAndSet(List<Map<String, dynamic>> live, {required bool fromLive}) {
+    // Live list wins for records it has; fallback records already in _all are kept
+    // if the live list is empty (e.g. ceoWithdrawals was never written, old ones live elsewhere)
+    if (live.isEmpty && _all.isNotEmpty) return;
+    setState(() {
+      _all = live;
+      _loading = false;
+    });
+  }
+
+  // ---------- Helpers ----------
+  double _amt(Map w) {
+    final v = w['amount'] ?? w['amountGHS'] ?? w['ghs'] ?? w['GHS'] ?? 0;
+    if (v is num) return v.toDouble();
+    return double.tryParse(v.toString()) ?? 0;
+  }
+
+  double? _usd(Map w) {
+    final v = w['amountUSD'] ?? w['dollars'] ?? w['USD'] ?? w['usd'];
+    if (v == null) return null;
+    if (v is num) return v.toDouble();
+    return double.tryParse(v.toString());
+  }
+
+  String _status(Map w) => ((w['status'] ?? 'pending') as String).toLowerCase();
+  String _method(Map w) => ((w['method'] ?? '') as String).toLowerCase();
+
+  List<Map<String, dynamic>> get _filtered {
+    var list = List<Map<String, dynamic>>.from(_all);
+    if (_filter == 'momo' || _filter == 'bank' || _filter == 'card') {
+      list = list.where((w) => _method(w) == _filter).toList();
+    } else if (_filter != 'all') {
+      list = list.where((w) => _status(w) == _filter).toList();
+    }
+    list.sort((a, b) {
+      final at = (a['createdAt'] is num ? (a['createdAt'] as num).toInt() : 0);
+      final bt = (b['createdAt'] is num ? (b['createdAt'] as num).toInt() : 0);
+      return bt.compareTo(at);
+    });
+    return list;
+  }
+
+  Map<String, dynamic> get _counts {
+    int pending = 0, approved = 0, rejected = 0, momo = 0, bank = 0, card = 0;
+    double total = 0, pendingAmt = 0, approvedAmt = 0, rejectedAmt = 0;
+    for (final w in _all) {
+      final s = _status(w);
+      final amt = _amt(w);
+      total += amt;
+      if (s == 'pending') { pending++; pendingAmt += amt; }
+      else if (s == 'approved' || s == 'completed') { approved++; approvedAmt += amt; }
+      else if (s == 'rejected') { rejected++; rejectedAmt += amt; }
+      if (_method(w) == 'momo') momo++;
+      if (_method(w) == 'bank') bank++;
+      if (_method(w) == 'card') card++;
+    }
+    return {
+      'all': _all.length, 'pending': pending, 'approved': approved, 'rejected': rejected,
+      'momo': momo, 'bank': bank, 'card': card,
+      'total': total, 'pendingAmt': pendingAmt, 'approvedAmt': approvedAmt, 'rejectedAmt': rejectedAmt,
+    };
+  }
+
+  void _toast(String m) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
+  }
+
+  // ---------- Approve / Reject ----------
+  Future<String?> _askText(String title, String initial) async {
+    final ctrl = TextEditingController(text: initial);
+    return showDialog<String>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text(title),
+        content: TextField(controller: ctrl, decoration: InputDecoration(hintText: tr('hrTypeHere'))),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: Text(tr('hrCancel'))),
+          ElevatedButton(onPressed: () => Navigator.pop(context, ctrl.text), child: Text(tr('hrConfirm'))),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _approve(Map w) async {
+    final id = w['id'].toString();
+    final note = await _askText(tr('hrApproveAskTitle'), 'Approved - Sent via ${_method(w)}');
+    if (note == null) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text(tr('hrApproveQ')),
+        content: Text('${tr('hrApproveGhsQ')} ${_amt(w).toStringAsFixed(2)}?'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: Text(tr('hrNo'))),
+          ElevatedButton(onPressed: () => Navigator.pop(context, true), child: Text(tr('hrYesApprove'))),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    try {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final upd = <String, Object?>{
+        'status': 'approved', 'approved': true, 'approvedAt': now,
+        'approvedAtStr': DateTime.now().toString(), 'ceoNote': note, 'approvedBy': 'CEO Asabere Peter',
+      };
+      // Write to ALL 5 paths, like the HTML did - so nurse + HR + CEO all see it
+      for (final path in ['nurseWithdrawals/$id', 'ceoWithdrawals/$id', 'hrWithdrawals/$id', 'withdrawalRequests/$id', 'ceoHRPage/withdrawals/$id']) {
+        await _db(path).update(upd);
+      }
+      final nurseId = (w['nurseId'] ?? w['nurseUid'] ?? '').toString();
+      if (nurseId.isNotEmpty) {
+        await _db('nurseNotifications/$nurseId/$id').set({
+          'type': 'withdrawal_approved',
+          'title': '${tr('hrNotifTitle')} - GHS ${_amt(w).toStringAsFixed(2)}',
+          'message': '${tr('hrNotifMsg1')} GHS ${_amt(w).toStringAsFixed(2)} ${tr('hrNotifMsgVia')} ${_method(w)} ${tr('hrNotifMsgApproved')} $note',
+          'amount': _amt(w), 'method': _method(w), 'createdAt': now, 'read': false,
+        });
+      }
+      _toast(tr('hrApprovedToast'));
+      await _loadAll();
+    } catch (e) {
+      _toast('${tr('hrApproveFailed')}: $e');
+    }
+  }
+
+  Future<void> _reject(Map w) async {
+    final id = w['id'].toString();
+    final reason = await _askText(tr('hrRejectAskTitle'), 'Insufficient details');
+    if (reason == null) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text(tr('hrRejectQ')),
+        content: Text(tr('hrRejectThisQ')),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: Text(tr('hrNo'))),
+          ElevatedButton(onPressed: () => Navigator.pop(context, true), child: Text(tr('hrYesReject'))),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    try {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final upd = <String, Object?>{
+        'status': 'rejected', 'approved': false, 'rejectedAt': now,
+        'rejectedAtStr': DateTime.now().toString(), 'ceoNote': reason, 'rejectedBy': 'CEO',
+      };
+      for (final path in ['nurseWithdrawals/$id', 'ceoWithdrawals/$id', 'hrWithdrawals/$id']) {
+        await _db(path).update(upd);
+      }
+      _toast(tr('hrRejectedToast'));
+      await _loadAll();
+    } catch (e) {
+      _toast('${tr('hrRejectFailed')}: $e');
+    }
+  }
+
+  void _viewDetails(Map w) {
+    final m = _method(w);
+    String details = '';
+    if (m == 'momo') details = '${tr('hrNetwork')}: ${w['momoNetwork'] ?? ''}\n${tr('hrNumber')}: ${w['momoNumber'] ?? ''}\n${tr('hrNameLabel')}: ${w['momoName'] ?? ''}';
+    else if (m == 'bank') details = '${tr('hrBank')}: ${w['bankName'] ?? ''}\n${tr('hrAccount')}: ${w['bankAccount'] ?? ''}\n${tr('hrNameLabel')}: ${w['bankAccountName'] ?? ''}';
+    else details = '${tr('hrType')}: ${w['cardType'] ?? ''}\n${tr('hrLast4')}: ****${w['cardNumber'] ?? ''}\n${tr('hrNameLabel')}: ${w['cardName'] ?? ''}';
+    final time = (w['createdAt'] is num) ? DateTime.fromMillisecondsSinceEpoch((w['createdAt'] as num).toInt()).toString() : '';
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text(tr('hrWithdrawalDetails')),
+        content: SingleChildScrollView(child: Text('${tr('hrIdLabel')}: ${w['withdrawalId'] ?? w['id']}\n${tr('hrNurseLabel')}: ${w['nurseName'] ?? tr('hrUnknown')}\n${tr('hrAmountLabel')}: GHS ${_amt(w).toStringAsFixed(2)}\n${tr('hrMethodLabel')}: $m\n${tr('hrStatusLabel')}: ${_status(w)}\n${tr('hrTimeLabel')}: $time\n\n${tr('hrDetailsLabel')}:\n$details')),
+        actions: [TextButton(onPressed: () => Navigator.pop(context), child: Text(tr('hrClose')))],
+      ),
+    );
+  }
+
+  void _copyDetails(Map w) {
+    final m = _method(w);
+    String methodLine = '';
+    if (m == 'momo') methodLine = '${tr('hrMomo')}: ${w['momoNetwork'] ?? ''} ${w['momoNumber'] ?? ''} ${tr('hrNameLabel')}: ${w['momoName'] ?? ''}';
+    else if (m == 'bank') methodLine = '${tr('hrBank')}: ${w['bankName'] ?? ''} ${tr('hrAccLabel')}: ${w['bankAccount'] ?? ''} ${tr('hrNameLabel')}: ${w['bankAccountName'] ?? ''}';
+    else methodLine = '${tr('hrCard')}: ${w['cardType'] ?? ''} ****${w['cardNumber'] ?? ''} ${tr('hrNameLabel')}: ${w['cardName'] ?? ''}';
+    final text = '${tr('hrWithdrawalId')}: ${w['withdrawalId'] ?? w['id']}\n${tr('hrNurseLabel')}: ${w['nurseName'] ?? ''} (${w['nurseId'] ?? ''})\n${tr('hrAmountLabel')}: GHS ${_amt(w).toStringAsFixed(2)}\n${tr('hrMethodLabel')}: $m\n$methodLine';
+    Clipboard.setData(ClipboardData(text: text));
+    _toast(tr('hrCopied'));
+  }
+
+  // ---------- EXPORT + DELETE ----------
+  String _csvCell(String v) {
+    // Escape commas / quotes / newlines so Excel / Google Sheets opens it correctly
+    final s = v.replaceAll('"', '""');
+    if (s.contains(',') || s.contains('"') || s.contains('\n')) return '"$s"';
+    return s;
+  }
+
+  String _buildCsv(List<Map<String, dynamic>> list) {
+    final rows = <List<String>>[
+      ['ID', 'Nurse Name', 'Nurse ID', 'Nurse Email', 'Amount GHS', 'Amount USD', 'Method', 'Status', 'Requested', 'MoMo Network', 'MoMo Number', 'MoMo Name', 'Bank Name', 'Bank Account', 'Bank Account Name', 'Bank Branch', 'Card Type', 'Card Name', 'Booking ID', 'CEO Note'],
+    ];
+    for (final w in list) {
+      final usd = _usd(w);
+      final time = (w['createdAt'] is num) ? DateTime.fromMillisecondsSinceEpoch((w['createdAt'] as num).toInt()).toString() : '';
+      rows.add([
+        '${w['withdrawalId'] ?? w['id'] ?? ''}',
+        '${w['nurseName'] ?? ''}',
+        '${w['nurseId'] ?? ''}',
+        '${w['nurseEmail'] ?? ''}',
+        _amt(w).toStringAsFixed(2),
+        usd != null ? usd.toStringAsFixed(2) : '',
+        _method(w),
+        _status(w),
+        time,
+        '${w['momoNetwork'] ?? ''}',
+        '${w['momoNumber'] ?? ''}',
+        '${w['momoName'] ?? ''}',
+        '${w['bankName'] ?? ''}',
+        '${w['bankAccount'] ?? ''}',
+        '${w['bankAccountName'] ?? ''}',
+        '${w['bankBranch'] ?? ''}',
+        '${w['cardType'] ?? ''}',
+        '${w['cardName'] ?? ''}',
+        '${w['bookingId'] ?? ''}',
+        '${w['ceoNote'] ?? ''}',
+      ]);
+    }
+    return rows.map((r) => r.map(_csvCell).join(',')).join('\n');
+  }
+
+  Future<void> _export() async {
+    final list = _filtered;
+    if (list.isEmpty) { _toast(tr('hrNothingToExport')); return; }
+    final csv = _buildCsv(list);
+    // EXPORT = copy CSV to clipboard + show it.
+    // NO web-only import here - it breaks WASM build (your error in screenshot).
+    // Copy -> paste into Excel / Google Sheets / WhatsApp / Notes = saved.
+    // On phone, long-press the text in the popup to Select All + Copy again.
+    await Clipboard.setData(ClipboardData(text: csv));
+    if (!mounted) return;
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text(tr('hrExportCsvCopied')),
+        content: SingleChildScrollView(child: Text('${tr('hrSavedRows')} ${list.length} ${tr('hrRowsToClipboard')}\n\n${tr('hrPasteInto')}\n\n$csv')),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: Text(tr('hrClose'))),
+          ElevatedButton(onPressed: () { Clipboard.setData(ClipboardData(text: csv)); Navigator.pop(context); _toast(tr('hrCopiedAgain')); }, child: Text(tr('hrCopyAgain'))),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _deleteOne(Map w) async {
+    final id = w['id'].toString();
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text(tr('hrDeleteThisQ')),
+        content: Text('${tr('hrDeleteGhs')} ${_amt(w).toStringAsFixed(2)} - ${w['nurseName'] ?? tr('hrUnknown')}?\n\n${tr('hrDeleteOneBody')}'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: Text(tr('hrCancel'))),
+          ElevatedButton(style: ElevatedButton.styleFrom(backgroundColor: Colors.red), onPressed: () => Navigator.pop(context, true), child: Text(tr('hrDelete'))),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    try {
+      for (final path in ['ceoWithdrawals/$id', 'nurseWithdrawals/$id', 'hrWithdrawals/$id', 'withdrawalRequests/$id', 'ceoHRPage/withdrawals/$id']) {
+        await _db(path).remove();
+      }
+      if (mounted) setState(() => _all.removeWhere((x) => x['id'].toString() == id));
+      _toast(tr('hrDeleted'));
+    } catch (e) {
+      _toast('${tr('hrDeleteFailed')}: $e');
+    }
+  }
+
+  Future<void> _deleteAllFiltered() async {
+    final list = _filtered;
+    if (list.isEmpty) { _toast(tr('hrNothingToDelete')); return; }
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text('${tr('hrDeleteAll')} ${list.length} ${tr('hrShownWithdrawalsQ')}'),
+        content: Text('${tr('hrDeleteAllBody1')} $list.length ${tr('hrDeleteAllBody2')} ($_filter).\n\n${tr('hrDeleteAllBody3')}\n\n${tr('hrDeleteAllBody4')}'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: Text(tr('hrCancel'))),
+          ElevatedButton(style: ElevatedButton.styleFrom(backgroundColor: Colors.red), onPressed: () => Navigator.pop(context, true), child: Text(tr('hrDeleteAllBtn'))),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    // Export first automatically? No - user was told to Export first. Just delete.
+    int done = 0;
+    for (final w in list) {
+      final id = w['id'].toString();
+      try {
+        for (final path in ['ceoWithdrawals/$id', 'nurseWithdrawals/$id', 'hrWithdrawals/$id', 'withdrawalRequests/$id', 'ceoHRPage/withdrawals/$id']) {
+          await _db(path).remove();
+        }
+        done++;
+      } catch (_) {}
+    }
+    if (mounted) setState(() => _all.removeWhere((x) => list.any((d) => d['id'].toString() == x['id'].toString())));
+    _toast('${tr('hrDeletedCount')}: $done ${tr('hrWithdrawalsWord')}');
+  }
+
+  // ---------- UI ----------
+  @override
+  Widget build(BuildContext context) {
+    const bg = Color(0xFF0C0A1E);
+    const card = Color(0xFF1A1633);
+    const gold = Color(0xFFFACC15);
+    final c = _counts;
+    final filtered = _filtered;
+
+    Widget tab(String key, String label, int count) {
+      final active = _filter == key;
+      return GestureDetector(
+        onTap: () => setState(() => _filter = key),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          decoration: BoxDecoration(
+            color: active ? gold : Colors.white.withOpacity(0.05),
+            borderRadius: BorderRadius.circular(999),
+            border: Border.all(color: Colors.white.withOpacity(0.08)),
+          ),
+          child: Text('$label ($count)', style: TextStyle(color: active ? Colors.black : const Color(0xFF9A95B8), fontSize: 12, fontWeight: FontWeight.w700)),
+        ),
+      );
+    }
+
+    Widget stat(String label, String value, String sub) {
+      return Container(
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(color: card, borderRadius: BorderRadius.circular(14), border: Border.all(color: Colors.white.withOpacity(0.08))),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(label, style: const TextStyle(color: Color(0xFF9A95B8), fontSize: 11)),
+          const SizedBox(height: 4),
+          Text(value, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Colors.white)),
+          Text(sub, style: const TextStyle(color: Color(0xFF9A95B8), fontSize: 11)),
+        ]),
+      );
+    }
+
+    return Scaffold(
+      backgroundColor: bg,
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF0C0A1E),
+        title: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(tr('hrPageTitle'), style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800)),
+          Text(tr('hrPageSubtitle'), style: TextStyle(fontSize: 10, color: Color(0xFF9A95B8))),
+        ]),
+        actions: [
+          DropdownButtonHideUnderline(child: DropdownButton<String>(value: LanguageService.instance.locale.languageCode, dropdownColor: const Color(0xFF0C0A1E), icon: const Icon(Icons.language, color: Colors.white, size: 24), items: LanguageService.languageNames.entries.map((e) => DropdownMenuItem(value: e.key, child: Text(e.value, style: const TextStyle(color: Colors.black)))).toList(), onChanged: (v) { if (v != null) LanguageService.instance.setLanguage(v); })),
+          Chip(label: Text("${c['all']} ${tr('hrRequests')}"), backgroundColor: Colors.white.withOpacity(0.06)),
+          TextButton.icon(icon: const Icon(Icons.download, size: 16, color: Color(0xFFFACC15)), label: Text(tr('hrExport'), style: TextStyle(color: Color(0xFFFACC15), fontSize: 12, fontWeight: FontWeight.bold)), onPressed: _export),
+          TextButton.icon(icon: const Icon(Icons.delete_forever, size: 16, color: Colors.redAccent), label: Text(tr('hrDeleteAllBtn'), style: TextStyle(color: Colors.redAccent, fontSize: 12, fontWeight: FontWeight.bold)), onPressed: _deleteAllFiltered),
+          IconButton(icon: const Icon(Icons.refresh), onPressed: _loadAll, tooltip: tr('hrRefresh')),
+        ],
+      ),
+      body: Column(
+        children: [
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.all(12),
+            child: Row(children: [
+              tab('all', tr('hrAll'), c['all']), const SizedBox(width: 8),
+              tab('pending', tr('hrPending'), c['pending']), const SizedBox(width: 8),
+              tab('approved', tr('hrApproved'), c['approved']), const SizedBox(width: 8),
+              tab('rejected', tr('hrRejected'), c['rejected']), const SizedBox(width: 8),
+              tab('momo', tr('hrMomo'), c['momo']), const SizedBox(width: 8),
+              tab('bank', tr('hrBank'), c['bank']), const SizedBox(width: 8),
+              tab('card', tr('hrCard'), c['card']),
+            ]),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            child: Wrap(
+              spacing: 10, runSpacing: 10,
+              children: [
+                SizedBox(width: 160, child: stat(tr('hrPending'), '${c['pending']}', 'GHS ${(c['pendingAmt'] as double).toStringAsFixed(2)}')),
+                SizedBox(width: 160, child: stat(tr('hrApproved'), '${c['approved']}', 'GHS ${(c['approvedAmt'] as double).toStringAsFixed(2)}')),
+                SizedBox(width: 160, child: stat(tr('hrRejected'), '${c['rejected']}', 'GHS ${(c['rejectedAmt'] as double).toStringAsFixed(2)}')),
+                SizedBox(width: 160, child: stat(tr('hrTotalRequested'), 'GHS ${(c['total'] as double).toStringAsFixed(2)}', tr('hrAllTime'))),
+                SizedBox(width: 160, child: stat(tr('hrMomo'), '${c['momo']}', tr('hrRequests'))),
+                SizedBox(width: 160, child: stat(tr('hrBank'), '${c['bank']}', tr('hrRequests'))),
+              ],
+            ),
+          ),
+          const SizedBox(height: 12),
+          if (_error != null)
+            Container(
+              margin: const EdgeInsets.symmetric(horizontal: 12),
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(color: Colors.red.withOpacity(0.15), borderRadius: BorderRadius.circular(12)),
+              child: Text(_error!, style: const TextStyle(color: Colors.redAccent, fontSize: 12)),
+            ),
+          Expanded(
+            child: _loading
+                ? Center(child: Column(mainAxisSize: MainAxisSize.min, children: [CircularProgressIndicator(), SizedBox(height: 12), Text(tr('hrLoading'), style: TextStyle(color: Color(0xFF9A95B8)))]))
+                : filtered.isEmpty
+                    ? Center(child: Text('${tr('hrNo')} $_filter ${tr('hrWithdrawalsWord')}', style: const TextStyle(color: Color(0xFF9A95B8))))
+                    : ListView.builder(
+                        padding: const EdgeInsets.fromLTRB(12, 0, 12, 100),
+                        itemCount: filtered.length,
+                        itemBuilder: (_, i) => _withdrawalCard(filtered[i]),
+                      ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _withdrawalCard(Map w) {
+    final s = _status(w);
+    final m = _method(w);
+    final amt = _amt(w);
+    final usd = _usd(w);
+    final statusText = s == 'approved' ? tr('hrApprovedUpper') : s == 'completed' ? tr('hrCompletedUpper') : s == 'rejected' ? tr('hrRejectedUpper') : tr('hrPendingUpper');
+    final statusColor = s == 'pending' ? const Color(0xFFFDE68A) : s == 'approved' || s == 'completed' ? const Color(0xFF86EFAC) : const Color(0xFFFCA5A5);
+    final timeStr = (w['createdAt'] is num) ? DateTime.fromMillisecondsSinceEpoch((w['createdAt'] as num).toInt()).toString() : '';
+
+    Widget detailLine(String label, String value) {
+      return Padding(
+        padding: const EdgeInsets.only(bottom: 2),
+        child: Text('$label: $value', style: const TextStyle(fontSize: 12, color: Colors.white)),
+      );
+    }
+
+    Widget methodDetails() {
+      if (m == 'momo') {
+        return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          detailLine(tr('hrNetwork'), '${w['momoNetwork'] ?? tr('hrMomo')}'),
+          detailLine(tr('hrNumber'), '${w['momoNumber'] ?? ''}'),
+          detailLine(tr('hrNameLabel'), '${w['momoName'] ?? ''}'),
+        ]);
+      } else if (m == 'bank') {
+        return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          detailLine(tr('hrBank'), '${w['bankName'] ?? ''}'),
+          detailLine(tr('hrAccount'), '${w['bankAccount'] ?? ''}'),
+          detailLine(tr('hrNameLabel'), '${w['bankAccountName'] ?? ''}'),
+          detailLine(tr('hrBranch'), '${w['bankBranch'] ?? tr('hrNa')}'),
+        ]);
+      } else if (m == 'card') {
+        return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          detailLine(tr('hrType'), '${w['cardType'] ?? ''}'),
+          detailLine(tr('hrLast4'), '****${w['cardNumber'] ?? ''}'),
+          detailLine(tr('hrNameLabel'), '${w['cardName'] ?? ''}'),
+        ]);
+      }
+      return Text(tr('hrMethodDetailsNotProvided'), style: TextStyle(fontSize: 12, color: Colors.white70));
+    }
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(color: const Color(0xFF1A1633), borderRadius: BorderRadius.circular(16), border: Border.all(color: Colors.white.withOpacity(0.08))),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+          Expanded(child: Text('GHS ${amt.toStringAsFixed(2)}${usd != null ? '  •  USD ${usd.toStringAsFixed(2)}' : ''} - ${m.toUpperCase()}', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white))),
+          Container(padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4), decoration: BoxDecoration(color: statusColor.withOpacity(0.15), borderRadius: BorderRadius.circular(999)), child: Text(statusText, style: TextStyle(color: statusColor, fontSize: 10, fontWeight: FontWeight.w800))),
+        ]),
+        const SizedBox(height: 8),
+        Text('${tr('hrNurseLabel')}: ${w['nurseName'] ?? tr('hrUnknown')} (${w['nurseEmail'] ?? ''})', style: const TextStyle(fontSize: 12, color: Colors.white)),
+        if (w['bookingId'] != null)
+          Container(
+            margin: const EdgeInsets.only(top: 6),
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(color: const Color(0xFFFACC15).withOpacity(0.15), borderRadius: BorderRadius.circular(8)),
+            child: Text('${tr('hrBookingId')}: ${w['bookingId']} - ${tr('hrTotalLabel')}: GHS ${(double.tryParse('${w['bookingTotal'] ?? amt}') ?? amt).toStringAsFixed(2)}', style: const TextStyle(fontSize: 12, color: Color(0xFFFACC15))),
+          ),
+        Text('${tr('hrIdLabel')}: ${w['nurseId'] ?? ''}', style: const TextStyle(fontSize: 11, color: Colors.white70)),
+        Text('${tr('hrRequested')}: $timeStr', style: const TextStyle(fontSize: 11, color: Colors.white70)),
+        Container(
+          margin: const EdgeInsets.only(top: 8),
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(color: const Color(0xFF0C0A1E).withOpacity(0.6), borderRadius: BorderRadius.circular(10)),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(tr('hrWithdrawalDetailsCeo'), style: TextStyle(fontSize: 11, color: Color(0xFF9A95B8), fontWeight: FontWeight.bold)),
+            const SizedBox(height: 6),
+            methodDetails(),
+            if (w['notes'] != null) Padding(padding: const EdgeInsets.only(top: 8), child: Text('${tr('hrNotes')}: ${w['notes']}', style: const TextStyle(fontSize: 12, color: Colors.white))),
+          ]),
+        ),
+        const SizedBox(height: 14),
+        Wrap(spacing: 8, runSpacing: 8, children: [
+          if (s == 'pending') ...[
+            ElevatedButton(onPressed: () => _approve(w), style: ElevatedButton.styleFrom(backgroundColor: Colors.green), child: Text('${tr('hrApproveSendGhs')} ${amt.toStringAsFixed(2)}', style: const TextStyle(fontSize: 11))),
+            ElevatedButton(onPressed: () => _reject(w), style: ElevatedButton.styleFrom(backgroundColor: Colors.red), child: Text(tr('hrRejectBtn'), style: TextStyle(fontSize: 11))),
+          ],
+          OutlinedButton(onPressed: () => _viewDetails(w), child: Text(tr('hrFullDetails'), style: TextStyle(fontSize: 11))),
+          OutlinedButton(onPressed: () => _copyDetails(w), child: Text(tr('hrCopyDetails'), style: TextStyle(fontSize: 11, color: Color(0xFFFACC15)))),
+          OutlinedButton(onPressed: () => _deleteOne(w), style: OutlinedButton.styleFrom(side: const BorderSide(color: Colors.red)), child: Text(tr('hrDelete'), style: TextStyle(fontSize: 11, color: Colors.redAccent))),
+        ]),
+      ]),
+    );
+  }
+}
+
+// Alias: both names point to the same screen, so main.dart works either way.
+typedef HRWithdrawalsPage = HRPageScreen;
